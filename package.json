@@ -1,7 +1,7 @@
 {
   "name": "onion-fetch",
   "version": "0.0.1",
-  "description": "一个轻量且灵活的、受 Koa 洋葱模型启发的 fetch 客户端库，允许开发者轻松定义和组合请求与响应中间件，以实现强大且可定制的 HTTP 请求。",
+  "description": "Onion Fetch is a lightweight, middleware-based fetch library for browsers and Node.js, inspired by Koa.js. It provides a flexible and extensible way to make HTTP requests.",
   "exports": {
     ".": {
       "import": "./dist/index.mjs",
