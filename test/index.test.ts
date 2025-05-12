@@ -1,73 +1,75 @@
-import { describe, it, expect, vi, beforeAll } from 'vitest';
-import {
-  createApp,
-  createError,
-  eventHandler,
-  readBody,
-  readRawBody,
-  toNodeListener,
-} from "h3";
+import { describe, it, expect, vi, beforeAll, afterAll, beforeEach } from 'vitest';
+import { createApp, createError, eventHandler, getRouterParams, readBody, readRawBody, toNodeListener } from 'h3';
+import { listen } from 'listhen';
 import { createRequest } from '../src';
-
+import path from 'path';
 
 describe('onion-fetch', () => {
-  const fetch = vi.spyOn(globalThis, "fetch");
+  let listener;
+
+  const getURL = (url: string) => path.join(listener.url, url);
+
+  const fetch = vi.spyOn(globalThis, 'fetch');
+  const $fetch = createRequest();
 
   beforeAll(async () => {
     const app = createApp()
       .use(
-        "/ok",
-        eventHandler(() => "ok")
+        '/ok',
+        eventHandler(() => 'ok')
       )
-      // .use(
-      //   "/params",
-      //   eventHandler((event) => getQuery(event.node.req.url || ""))
-      // )
       .use(
-        "/url",
+        '/params',
+        eventHandler((event) => {
+          const url = new URL(event.node.req.url || '', 'http://localhost');
+          const params = Object.fromEntries(url.searchParams.entries());
+          return params;
+        })
+      )
+      .use(
+        '/base/foo',
+        eventHandler(() => 'foo')
+      )
+      .use(
+        '/url',
         eventHandler((event) => event.node.req.url)
       )
       .use(
-        "/echo",
+        '/echo',
         eventHandler(async (event) => ({
           path: event.path,
-          body:
-            event.node.req.method === "POST"
-              ? await readRawBody(event)
-              : undefined,
+          body: event.node.req.method === 'POST' ? await readRawBody(event) : undefined,
           headers: event.node.req.headers,
         }))
       )
       .use(
-        "/post",
+        '/post',
         eventHandler(async (event) => ({
           body: await readBody(event),
           headers: event.node.req.headers,
         }))
       )
       .use(
-        "/binary",
+        '/binary',
         eventHandler((event) => {
-          event.node.res.setHeader("Content-Type", "application/octet-stream");
-          return new Blob(["binary"]);
+          event.node.res.setHeader('Content-Type', 'application/octet-stream');
+          return new Blob(['binary']);
         })
       )
       .use(
-        "/403",
-        eventHandler(() =>
-          createError({ status: 403, statusMessage: "Forbidden" })
-        )
+        '/403',
+        eventHandler(() => createError({ status: 403, statusMessage: 'Forbidden' }))
       )
       .use(
-        "/408",
+        '/408',
         eventHandler(() => createError({ status: 408 }))
       )
       .use(
-        "/204",
+        '/204',
         eventHandler(() => null) // eslint-disable-line unicorn/no-null
       )
       .use(
-        "/timeout",
+        '/timeout',
         eventHandler(async () => {
           await new Promise((resolve) => {
             setTimeout(() => {
@@ -76,8 +78,138 @@ describe('onion-fetch', () => {
           });
         })
       );
+
+    listener = await listen(toNodeListener(app));
   });
-})
+
+  afterAll(() => {
+    listener.close().catch(console.error);
+  });
+
+  beforeEach(() => {
+    fetch.mockClear();
+  });
+
+  it('ok', async () => {
+    expect(await $fetch(getURL('ok'))).to.equal('ok');
+  });
+
+  it('baseURL', async () => {
+    const $fetch = createRequest({
+      baseURL: getURL('base')
+    });
+    const res = await $fetch('/foo');
+    expect(res).to.equal('foo');
+  });
+
+  it('middleware', async () => {
+    const executionOrder: string[] = [];
+    const globalMiddleware = vi.fn(async (ctx, next) => {
+      executionOrder.push('before global middleware');
+      ctx.options.headers = { 'X-Global': 'yes' };
+      await next();
+      executionOrder.push('after global middleware');
+      // 验证中间件可以修改响应
+      if (ctx.response) {
+        ctx.response._data.modified = true;
+      }
+    });
+
+    const requestMiddleware = vi.fn(async (ctx, next) => {
+      executionOrder.push('before request middleware');
+      ctx.options.headers = { ...ctx.options.headers, 'X-Request': 'yes' };
+      await next();
+      executionOrder.push('after request middleware');
+    });
+
+    const $fetch = createRequest({ middlewares: [globalMiddleware] });
+    const response = await $fetch(getURL('echo'), {
+      middlewares: [requestMiddleware]
+    });
+
+    // 验证中间件执行顺序
+    expect(executionOrder).to.deep.equal([
+      'before global middleware',
+      'before request middleware',
+      'after request middleware',
+      'after global middleware'
+    ]);
+
+    // 验证请求头被正确修改
+    expect(response?.headers).to.include({
+      'x-global': 'yes',
+      'x-request': 'yes'
+    });
+
+    // 验证响应被中间件修改
+    expect(response?.modified).to.be.true;
+  });
+
+  it('allows specifying FetchResponse method', async () => {
+    expect(await $fetch(getURL('params?test=true'), { responseType: 'json' })).to.deep.equal({ test: 'true' });
+    expect(await $fetch(getURL('params?test=true'), { responseType: 'blob' })).to.be.instanceOf(Blob);
+    expect(await $fetch(getURL('params?test=true'), { responseType: 'text' })).to.equal('{"test":"true"}');
+    expect(await $fetch(getURL('params?test=true'), { responseType: 'arrayBuffer' })).to.be.instanceOf(ArrayBuffer);
+  });
+
+  it('stringifies posts body automatically', async () => {
+    const { body } = await $fetch(getURL('post'), {
+      method: 'POST',
+      body: { num: 42 },
+    });
+    expect(body).to.deep.eq({ num: 42 });
+
+    const body2 = (
+      await $fetch(getURL('post'), {
+        method: 'POST',
+        body: [{ num: 42 }, { num: 43 }],
+      })
+    ).body;
+    expect(body2).to.deep.eq([{ num: 42 }, { num: 43 }]);
+
+    const headerFetches = [[['X-header', '1']], { 'x-header': '1' }, new Headers({ 'x-header': '1' })];
+
+    for (const sentHeaders of headerFetches) {
+      const { headers } = await $fetch(getURL('post'), {
+        method: 'POST',
+        body: { num: 42 },
+        headers: sentHeaders as HeadersInit,
+      });
+      expect(headers).to.include({ 'x-header': '1' });
+      expect(headers).to.include({ accept: 'application/json' });
+    }
+  });
+
+  it('does not stringify body when content type != application/json', async () => {
+    const message = '"Hallo von Pascal"';
+    const { body } = await $fetch(getURL('echo'), {
+      method: 'POST',
+      body: message,
+      headers: { 'Content-Type': 'text/plain' },
+    });
+    expect(body).to.deep.eq(message);
+  });
+
+  it('Bypass FormData body', async () => {
+    const data = new FormData();
+    data.append('foo', 'bar');
+    const { body } = await $fetch(getURL('post'), {
+      method: 'POST',
+      body: data,
+    });
+    expect(body).to.include('form-data; name="foo"');
+  });
+
+  it('204 no content', async () => {
+    const res = await $fetch(getURL('204'));
+    expect(res).toBeUndefined();
+  });
+
+  it('HEAD no content', async () => {
+    const res = await $fetch(getURL('/ok'), { method: 'HEAD' });
+    expect(res).toBeUndefined();
+  });
+});
 
 // describe('baseURL Tests', () => {
 //   const $fetch = createRequest({
@@ -92,9 +224,7 @@ describe('onion-fetch', () => {
 //   });
 // })
 
-
 // describe('Core Functionality Tests', () => {
-
 
 //   beforeEach(() => {
 //     mockFetch.mockReset();
@@ -210,11 +340,11 @@ describe('onion-fetch', () => {
 
 //   it('should apply request-specific middlewares after global ones', async () => {
 //     const globalMiddleware = vi.fn((ctx, next) => {
-//       ctx.request.options.headers = { 'X-Global': 'yes' };
+//       ctx.options.headers = { 'X-Global': 'yes' };
 //       return next();
 //     });
 //     const requestMiddleware = vi.fn((ctx, next) => {
-//       ctx.request.options.headers = { ...ctx.request.options.headers, 'X-Request': 'yes' };
+//       ctx.options.headers = { ...ctx.options.headers, 'X-Request': 'yes' };
 //       return next();
 //     });
 

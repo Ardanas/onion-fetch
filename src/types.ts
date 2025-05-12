@@ -31,7 +31,7 @@ export interface ResponseData<T = any> {
 export interface Context<T = any, R extends ResponseType = ResponseType> {
   request: FetchRequest;
   options: FetchOptions<R>;
-  response?: FetchResponse<T>;
+  response: FetchResponse<T> | undefined;
   error?: Error;
 }
 
